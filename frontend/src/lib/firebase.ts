@@ -2,6 +2,7 @@
 import { initializeApp } from "firebase/app";
 import { getAnalytics } from "firebase/analytics";
 import { getAuth,
+    connectAuthEmulator,
   GoogleAuthProvider,
   signInWithPopup,
   signInWithEmailAndPassword,
@@ -34,6 +35,10 @@ const firebaseConfig = {
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
+
+if (import.meta.env.DEV) {
+  connectAuthEmulator(auth, "http://127.0.0.1:9099");
+}
 export const provider = new GoogleAuthProvider();
 
 // Firebase authentication functions
