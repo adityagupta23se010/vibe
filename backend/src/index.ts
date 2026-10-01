@@ -5,6 +5,8 @@ await import('./instrument.js');
 
 import * as Sentry from '@sentry/node';
 import express from 'express';
+import http from 'node:http';
+import { Server as SocketIOServer } from 'socket.io';
 // import session from 'express-session'
 import { useExpressServer, RoutingControllersOptions } from 'routing-controllers';
 import { appConfig } from './config/app.js';
@@ -19,6 +21,9 @@ import { authorizationChecker } from './shared/functions/authorizationChecker.js
 import { currentUserChecker } from './shared/functions/currentUserChecker.js';
 import { startCron } from './utils/startCron.js';
 import { GLOBAL_TYPES } from './types.js';
+import { AUTH_TYPES } from './modules/auth/types.js';
+import type { IAuthService } from './modules/auth/interfaces/IAuthService.js';
+import { WHITEBOARD_TYPES, WhiteboardGateway, WhiteboardService } from './modules/whiteboard/index.js';
 
 const app = express();
 const globalRateLimiter = createRateLimiter();
@@ -81,10 +86,18 @@ if (NODE_ENV === 'production' || NODE_ENV === 'staging') {
 const database = getContainer().get<MongoDatabase>(GLOBAL_TYPES.Database);
 await database.connect();
 
-// Start server
+// Socket.IO shares this HTTP server so authenticated whiteboard events and REST
+// calls have the same origin and deployment lifecycle.
 useExpressServer(app, moduleOptions);
+const server = http.createServer(app);
+const io = new SocketIOServer(server, { cors: corsOptions });
+new WhiteboardGateway(
+  io,
+  getContainer().get<IAuthService>(AUTH_TYPES.AuthService),
+  getContainer().get<WhiteboardService>(WHITEBOARD_TYPES.Service),
+);
 
-app.listen(appConfig.port, () => {
+server.listen(appConfig.port, () => {
   printStartupSummary();
   startCron();
 });

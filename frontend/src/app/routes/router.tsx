@@ -77,6 +77,9 @@ import StudentActivityDetail from '@/app/pages/student/hp-system/activity-detail
 import { StudentHpGuard } from '@/components/hp-system/StudentHpGuard'
 import NotificationsPage from '@/app/pages/shared/NotificationsPage'
 import SupportDashboard from '@/app/pages/teacher/support-dashboard'
+import WhiteboardPage from '@/features/whiteboard/WhiteboardPage'
+import WhiteboardHistory from '@/features/whiteboard/WhiteboardHistory'
+import ReplayView from '@/features/whiteboard/ReplayView'
 
 // Root route with error and notFound handling
 const rootRoute = new RootRoute({
@@ -716,6 +719,16 @@ const teacherShareVideoRoute = new Route({
   component: ShareVideoPage
 })
 
+// Whiteboard routes live under each role's layout route (not the bare root)
+// so they inherit the layout's auth/role guard like every other teacher or
+// student page — the board itself still re-checks membership server-side.
+const teacherWhiteboardRoute = new Route({ getParentRoute: () => teacherLayoutRoute, path: '/whiteboard', component: WhiteboardHistory })
+const teacherWhiteboardRoomRoute = new Route({ getParentRoute: () => teacherLayoutRoute, path: '/whiteboard/$roomCode', component: WhiteboardPage })
+const teacherWhiteboardReplayRoute = new Route({ getParentRoute: () => teacherLayoutRoute, path: '/whiteboard/$roomCode/replay', component: ReplayView })
+const studentWhiteboardRoute = new Route({ getParentRoute: () => studentLayoutRoute, path: '/whiteboard', component: WhiteboardHistory })
+const studentWhiteboardRoomRoute = new Route({ getParentRoute: () => studentLayoutRoute, path: '/whiteboard/$roomCode', component: WhiteboardPage })
+const studentWhiteboardReplayRoute = new Route({ getParentRoute: () => studentLayoutRoute, path: '/whiteboard/$roomCode/replay', component: ReplayView })
+
 // Share link landing — public on purpose. The token in the URL is the
 // credential, and the whole point is that a recipient never has to sign in.
 export const shareLinkRoute = new Route({
@@ -772,6 +785,9 @@ const routeTree = rootRoute.addChildren([
     teacherSubmissionDetailsRoute,
     teacherNotificationsRoute,
     teacherShareVideoRoute,
+    teacherWhiteboardRoute,
+    teacherWhiteboardRoomRoute,
+    teacherWhiteboardReplayRoute,
   ]),
   studentLayoutRoute.addChildren([
     studentDashboardRoute,
@@ -789,6 +805,9 @@ const routeTree = rootRoute.addChildren([
     studentHpSystemSubmissionsRoute,
     studentHpSystemLedgerRoute,
     studentNotificationsRoute,
+    studentWhiteboardRoute,
+    studentWhiteboardRoomRoute,
+    studentWhiteboardReplayRoute,
   ]),
   coursePageRoute,
 ]);

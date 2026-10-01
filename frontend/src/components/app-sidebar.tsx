@@ -11,6 +11,7 @@ import {
   LifeBuoy,
   Map,
   Megaphone,
+  PanelTop,
   PieChart,
   Settings2,
   Shield,
@@ -69,6 +70,11 @@ export function AppSidebar() {
         title: "Announcements",
         url: "/teacher/announcements",
         icon: Megaphone,
+      },
+      {
+        title: "Whiteboard",
+        url: "/teacher/whiteboard",
+        icon: PanelTop,
       },
       // The HP System is opt-in per course, so this only appears once the
       // instructor has a course that uses it.
