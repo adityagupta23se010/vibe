@@ -253,13 +253,30 @@ describe('room access', () => {
     const owner = await client('owner');
     const bob = await client('bob');
     const results = await Promise.all(
-      Array.from({length: 12}, (_, i) =>
+      Array.from({length: 60}, (_, i) =>
         ack<any>(i % 2 ? bob : owner, 'object:create', stroke(`burst-object-${i}`)),
       ),
     );
     expect(results.filter(r => !r.ok)).toEqual([]);
     const activity = await service.activity(room, OWNER, 0, 500);
     expect(new Set(activity.map(a => a.seq)).size).toBe(activity.length);
+  });
+
+  it('continues the activity sequence for boards created before the seq counter', async () => {
+    const owner = await client('owner');
+    await ack(owner, 'object:create', stroke('legacy-seed-1'));
+    await ack(owner, 'object:create', stroke('legacy-seed-2'));
+    // Simulate a pre-counter board: drop the counter, keep its existing log.
+    const sessions = await db.getCollection<SessionDocument>('whiteboard_sessions');
+    await sessions.updateOne({roomCode: room}, {$unset: {activitySeq: ''}});
+    const results = await Promise.all(
+      Array.from({length: 10}, (_, i) =>
+        ack<any>(owner, 'object:create', stroke(`legacy-next-${i}`)),
+      ),
+    );
+    expect(results.filter(r => !r.ok)).toEqual([]);
+    const seqs = (await service.activity(room, OWNER, 0, 500)).map(a => a.seq);
+    expect(seqs).toEqual(Array.from({length: 12}, (_, i) => i + 1));
   });
 
   it('applies role changes live and persists them across a reconnect', async () => {

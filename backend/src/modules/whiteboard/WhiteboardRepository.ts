@@ -223,14 +223,44 @@ export class WhiteboardRepository {
     await this.objects.deleteMany({sessionId});
   }
 
+  /**
+   * Allocates the next activity sequence number atomically from a counter on
+   * the session document, so any number of concurrent writers each get a
+   * distinct seq in a single round trip (the previous read-max-then-insert
+   * approach collided under concurrency).
+   */
   async nextSeq(sessionId: ObjectId) {
     await this.init();
+    const bumped = await this.sessions.findOneAndUpdate(
+      {_id: sessionId, activitySeq: {$exists: true}},
+      {$inc: {activitySeq: 1}},
+      {returnDocument: 'after', projection: {activitySeq: 1}},
+    );
+    if (bumped?.activitySeq !== undefined) return bumped.activitySeq;
+    // Boards created before the counter existed: seed it from the current
+    // max seq. $ifNull makes the seeding race-safe — whichever concurrent
+    // writer lands first seeds, everyone after just increments.
     const last = await this.activity
       .find({sessionId})
       .sort({seq: -1})
       .limit(1)
       .toArray();
-    return (last[0]?.seq ?? 0) + 1;
+    const seeded = await this.sessions.findOneAndUpdate(
+      {_id: sessionId},
+      [
+        {
+          $set: {
+            activitySeq: {
+              $add: [{$ifNull: ['$activitySeq', last[0]?.seq ?? 0]}, 1],
+            },
+          },
+        },
+      ],
+      {returnDocument: 'after', projection: {activitySeq: 1}},
+    );
+    if (seeded?.activitySeq === undefined)
+      throw new Error('Whiteboard not found');
+    return seeded.activitySeq;
   }
   async appendActivity(entry: ActivityDocument) {
     await this.init();

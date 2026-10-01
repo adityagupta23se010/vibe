@@ -272,12 +272,40 @@ export class WhiteboardGateway {
     );
   }
 
+  private runningSync = new Map<string, Promise<void>>();
+  private queuedSync = new Map<string, Promise<void>>();
+
+  /**
+   * Coalesced room sync: at most one run in flight plus one queued per room.
+   * A caller arriving while a run is queued shares it — that run starts after
+   * the caller's write, so it still reflects it — which turns N simultaneous
+   * joins into ~2 DB reads instead of N reads and N² pushes.
+   */
+  private syncRoom(roomCode: string): Promise<void> {
+    const queued = this.queuedSync.get(roomCode);
+    if (queued) return queued;
+    const previous = this.runningSync.get(roomCode) ?? Promise.resolve();
+    const next: Promise<void> = previous
+      .catch(() => undefined)
+      .then(() => {
+        this.queuedSync.delete(roomCode);
+        return this.pushRoomState(roomCode);
+      })
+      .finally(() => {
+        if (this.runningSync.get(roomCode) === next)
+          this.runningSync.delete(roomCode);
+      });
+    this.queuedSync.set(roomCode, next);
+    this.runningSync.set(roomCode, next);
+    return next;
+  }
+
   /**
    * Re-derives every connected member's access from persisted state and
    * pushes it — each socket receives only its own access, and only the owner
    * receives owner-only data (the removed list).
    */
-  private async syncRoom(roomCode: string) {
+  private async pushRoomState(roomCode: string) {
     const session = await this.service.roomState(roomCode);
     if (!session) return;
     const sockets = this.roomSockets(roomCode).filter(

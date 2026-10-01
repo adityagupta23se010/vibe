@@ -38,7 +38,8 @@ const finite = (n: unknown) => typeof n === 'number' && Number.isFinite(n);
  * before moderation existed; the removed list is only shown to the owner.
  */
 export const serializeSession = (s: SessionDocument, forOwner = false) => {
-  const {removed, ...rest} = s;
+  // activitySeq is a server-internal counter; removed is owner-only (below).
+  const {removed, activitySeq: _activitySeq, ...rest} = s;
   return {
     ...rest,
     _id: s._id!.toString(),
@@ -99,6 +100,7 @@ export class WhiteboardService {
             name: (name || 'Untitled whiteboard').slice(0, 120),
             accessMode: 'anyone-with-link',
             defaultRole: 'editor',
+            activitySeq: 0,
             participants: [
               {userId: new ObjectId(userId), role: 'editor', joinedAt: now},
             ],
@@ -404,9 +406,8 @@ export class WhiteboardService {
     objectId: string,
     snapshot?: ObjectDocument,
   ) {
-    // nextSeq is read-then-insert, so two people drawing at the same moment
-    // can race for the same seq; the unique index rejects the loser, which
-    // simply takes the next one. (The object itself is already saved.)
+    // nextSeq is atomic; the retry only guards against legacy data that
+    // already holds a seq ahead of the counter.
     for (let attempt = 0; ; attempt++) {
       const seq = await this.repository.nextSeq(sessionId);
       try {
@@ -421,7 +422,7 @@ export class WhiteboardService {
         });
         return;
       } catch (error: any) {
-        if (error?.code !== 11000 || attempt >= 9) throw error;
+        if (error?.code !== 11000 || attempt >= 4) throw error;
       }
     }
   }

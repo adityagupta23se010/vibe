@@ -3,8 +3,10 @@ const POLL_MS = 100;
 /**
  * Voice-activity decision for one audio source, fed one RMS level per poll.
  *
- * - Adaptive noise floor: steady background noise (fans, hum) raises the
- *   floor, so it stops counting as speech after a moment.
+ * - Noise floor = the quietest level in the last FLOOR_WINDOW polls. Speech
+ *   always has short gaps between syllables, so its floor stays low; steady
+ *   noise (fans, hum) has no gaps, so it becomes the floor within ~1.5 s
+ *   and stops counting as speech.
  * - Onset: the level must stay above threshold for ONSET_POLLS consecutive
  *   polls, so short transients (keyboard clicks, a tapped desk) are ignored.
  * - Release: speech must stay quiet for RELEASE_MS before the indicator
@@ -12,21 +14,22 @@ const POLL_MS = 100;
  */
 export class VoiceActivity {
   static readonly MIN_THRESHOLD = 0.015; // RMS — never call anything quieter than this speech
-  static readonly FLOOR_RATIO = 2.5; // speech must be this many times louder than the noise floor
+  static readonly FLOOR_RATIO = 2; // speech must be this many times louder than the noise floor
+  static readonly FLOOR_WINDOW = 15; // polls (~1.5 s at 100 ms)
   static readonly ONSET_POLLS = 2;
   static readonly RELEASE_MS = 450;
 
   speaking = false;
-  private floor = VoiceActivity.MIN_THRESHOLD / VoiceActivity.FLOOR_RATIO;
+  private recent: number[] = [];
   private loudPolls = 0;
   private quietSince = 0;
 
   /** Returns true when the speaking state changed. */
   update(level: number, now: number): boolean {
-    // Floor drops quickly to quiet levels and creeps up slowly under sustained noise
-    // (speech is bursty, so it barely moves the floor).
-    this.floor = level < this.floor ? this.floor + (level - this.floor) * 0.3 : this.floor + (level - this.floor) * 0.01;
-    const threshold = Math.max(VoiceActivity.MIN_THRESHOLD, this.floor * VoiceActivity.FLOOR_RATIO);
+    this.recent.push(level);
+    if (this.recent.length > VoiceActivity.FLOOR_WINDOW) this.recent.shift();
+    const floor = Math.min(...this.recent);
+    const threshold = Math.max(VoiceActivity.MIN_THRESHOLD, floor * VoiceActivity.FLOOR_RATIO);
     const loud = level > threshold;
     this.loudPolls = loud ? this.loudPolls + 1 : 0;
     if (loud) this.quietSince = now;

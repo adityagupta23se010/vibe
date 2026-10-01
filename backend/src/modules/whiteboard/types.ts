@@ -128,6 +128,8 @@ export interface WhiteboardSession {
   voicePolicy?: VoicePolicy;
   /** Users the owner removed; they cannot re-enter via the link until re-admitted. */
   removed?: RemovedParticipant[];
+  /** Last allocated activity-log sequence number (server-internal counter). */
+  activitySeq?: number;
   createdAt: Date;
   updatedAt: Date;
 }

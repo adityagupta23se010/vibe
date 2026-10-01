@@ -449,13 +449,22 @@ describe('VoiceActivity (speaking indicator)', () => {
     expect(states.at(-1)).toBe(false);
   });
 
-  it('adapts to steady background noise (fan) but still hears speech over it', () => {
-    const fan = Array.from({ length: 150 }, () => 0.03);
+  it('adapts to steady background noise (fan) within ~1.5 s but still hears speech over it', () => {
+    // Fan noise jitters ±20% around its level, like real broadband noise.
+    const fan = Array.from({ length: 40 }, (_, i) => 0.06 * (1 + 0.2 * Math.sin(i * 1.7)));
     const { vad, states } = run(fan);
-    expect(states.at(-1)).toBe(false);
-    vad.update(0.2, 20_000);
-    vad.update(0.2, 20_100);
+    expect(states.slice(16).some(Boolean)).toBe(false); // quiet again after the 15-poll window
+    vad.update(0.3, 10_000);
+    vad.update(0.3, 10_100);
     expect(vad.speaking).toBe(true);
+  });
+
+  it('keeps detecting continuous syllabic speech (gaps keep the floor low)', () => {
+    // A quiet room, then 3 s of 220 ms syllables with 120 ms gaps, sampled every 100 ms.
+    const quiet = Array.from({ length: 15 }, () => 0.001);
+    const speech = Array.from({ length: 30 }, (_, i) => ((i * 100) % 340 < 220 ? 0.08 : 0.001));
+    const { states } = run([...quiet, ...speech]);
+    expect(states.slice(15 + 2).every(Boolean)).toBe(true); // on from the second loud poll, never drops between syllables
   });
 });
 
