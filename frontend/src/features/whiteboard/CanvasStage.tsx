@@ -127,6 +127,8 @@ export function CanvasStage({ board }: { board: WhiteboardBoard }) {
       const hit = hitTest(objects, world.x, world.y);
       if (hit) {
         if (!selectionRef.current.has(hit.id)) board.setSelection(event.shiftKey ? [...selectionRef.current, hit.id] : [hit.id]);
+        // Viewers may select (to inspect) but never move.
+        if (!isEditor) return;
         dragMode.current = 'move';
         dragObjectOrigin.current = new Map([...selectionRef.current].map(id => [id, { ...(objectsRef.current.get(id) as WhiteboardObject) }]));
       } else {
@@ -229,7 +231,7 @@ export function CanvasStage({ board }: { board: WhiteboardBoard }) {
       if (event.code === 'Space') spaceHeld.current = true;
       const mod = event.ctrlKey || event.metaKey;
       if (mod && event.key.toLowerCase() === 'z') { event.preventDefault(); if (event.shiftKey) board.redo(); else board.undo(); return; }
-      if ((event.key === 'Delete' || event.key === 'Backspace') && selectionRef.current.size) { event.preventDefault(); board.deleteSelected(); return; }
+      if ((event.key === 'Delete' || event.key === 'Backspace') && selectionRef.current.size && isEditor) { event.preventDefault(); board.deleteSelected(); return; }
       if (event.key === 'Escape') { board.setSelection([]); setTextEdit(null); return; }
       const map: Record<string, typeof tool> = { v: 'select', h: 'hand', p: 'pen', e: 'eraser', t: 'text', r: 'rectangle', o: 'ellipse', l: 'line', a: 'arrow' };
       if (!mod && map[event.key.toLowerCase()]) setTool(map[event.key.toLowerCase()]!);

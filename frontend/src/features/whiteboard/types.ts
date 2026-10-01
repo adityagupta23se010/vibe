@@ -12,8 +12,20 @@ export type RectObject = BaseObject & { type: 'rectangle' | 'ellipse'; x: number
 export type TextObject = BaseObject & { type: 'text'; x: number; y: number; width: number; text: string; fontSize: number };
 export type WhiteboardObject = StrokeObject | LineObject | RectObject | TextObject;
 
-export type Participant = { userId: string; role: WhiteboardRole; joinedAt: string };
-export type BoardSession = { _id: string; roomCode: string; name: string; createdBy: string; defaultRole: WhiteboardRole; participants: Participant[]; createdAt: string; updatedAt: string };
+/** Owner overrides for one participant; absent = follows the room's voice policy. */
+export type ParticipantVoicePermissions = { canJoin?: boolean; canSpeak?: boolean };
+export type Participant = { userId: string; role: WhiteboardRole; joinedAt: string; voice?: ParticipantVoicePermissions };
+export type VoicePolicy = { enabled: boolean; joinMuted: boolean; speakByDefault: boolean };
+export type RemovedParticipant = { userId: string; name?: string; removedAt: string };
+export type BoardSession = {
+  _id: string; roomCode: string; name: string; createdBy: string; defaultRole: WhiteboardRole; participants: Participant[];
+  boardLocked: boolean; voicePolicy: VoicePolicy;
+  /** Only sent to the owner. */
+  removed?: RemovedParticipant[];
+  createdAt: string; updatedAt: string;
+};
+/** What *this* user may do — computed and pushed by the server; the UI only mirrors it. */
+export type RoomAccess = { role: 'owner' | WhiteboardRole; isOwner: boolean; canEdit: boolean; canJoinVoice: boolean; canSpeak: boolean; joinMuted: boolean };
 
 export type Presence = { userId: string; name: string };
 export type RemoteCursor = { userId: string; name?: string; x: number; y: number; color: string; updatedAt: number };

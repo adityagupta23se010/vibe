@@ -7,10 +7,13 @@ import {
 } from 'routing-controllers';
 import {ObjectId} from 'mongodb';
 import {WhiteboardRepository} from './WhiteboardRepository.js';
+import {computeAccess, voicePolicyOf} from './access.js';
 import {
   ActivityDocument,
   ObjectDocument,
+  RoomAccess,
   SessionDocument,
+  VoicePolicy,
   WHITEBOARD_TYPES,
   WhiteboardObject,
   WhiteboardObjectInput,
@@ -30,12 +33,32 @@ const UUID_RE = /^[a-z0-9-]{8,64}$/i;
 const COLOR_RE = /^#[0-9a-f]{3,8}$/i;
 const finite = (n: unknown) => typeof n === 'number' && Number.isFinite(n);
 
-const serializeSession = (s: SessionDocument) => ({
-  ...s,
-  _id: s._id!.toString(),
-  createdBy: s.createdBy.toString(),
-  participants: s.participants.map(p => ({...p, userId: p.userId.toString()})),
-});
+/**
+ * Client view of a room. Policy defaults are filled in for boards created
+ * before moderation existed; the removed list is only shown to the owner.
+ */
+export const serializeSession = (s: SessionDocument, forOwner = false) => {
+  const {removed, ...rest} = s;
+  return {
+    ...rest,
+    _id: s._id!.toString(),
+    createdBy: s.createdBy.toString(),
+    participants: s.participants.map(p => ({
+      ...p,
+      userId: p.userId.toString(),
+    })),
+    boardLocked: !!s.boardLocked,
+    voicePolicy: voicePolicyOf(s),
+    ...(forOwner
+      ? {
+          removed: (removed ?? []).map(r => ({
+            ...r,
+            userId: r.userId.toString(),
+          })),
+        }
+      : {}),
+  };
+};
 const serializeObject = (o: ObjectDocument): WhiteboardObject => ({
   ...(o as any),
   id: o._id,
@@ -94,6 +117,10 @@ export class WhiteboardService {
   private async permission(roomCode: string, userId: string) {
     const session = await this.repository.findSession(roomCode);
     if (!session) throw new NotFoundError('Whiteboard not found');
+    if (session.removed?.some(r => r.userId.toString() === userId))
+      throw new ForbiddenError(
+        'You were removed from this collaboration room by the room owner.',
+      );
     const existing = session.participants.find(
       p => p.userId.toString() === userId,
     );
@@ -109,25 +136,28 @@ export class WhiteboardService {
         joinedAt: new Date(),
       });
     }
-    const role =
-      session.participants.find(p => p.userId.toString() === userId)?.role ??
-      session.defaultRole;
-    const isCreator = session.createdBy.toString() === userId;
-    return {session, role, isCreator};
+    const access = computeAccess(session, userId);
+    return {session, access, role: access.role, isCreator: access.isOwner};
   }
 
   async get(roomCode: string, userId: string) {
-    const {session, role, isCreator} = await this.permission(roomCode, userId);
+    const {session, access} = await this.permission(roomCode, userId);
     const objects = (await this.repository.listObjects(session._id!)).map(
       serializeObject,
     );
     return {
-      session: serializeSession(session),
+      session: serializeSession(session, access.isOwner),
       objects,
-      role,
-      isCreator,
+      role: access.role,
+      isCreator: access.isOwner,
+      access,
       userId,
     };
+  }
+
+  /** Current persisted room state, without auto-joining anyone — for pushing live access updates. */
+  async roomState(roomCode: string) {
+    return this.repository.findSession(roomCode);
   }
 
   async listMine(userId: string, limit: number, offset: number) {
@@ -137,7 +167,7 @@ export class WhiteboardService {
         Math.min(Math.max(limit, 1), 100),
         Math.max(offset, 0),
       )
-    ).map(serializeSession);
+    ).map(session => serializeSession(session));
   }
 
   async rename(roomCode: string, userId: string, name: string) {
@@ -159,8 +189,28 @@ export class WhiteboardService {
   }
 
   async role(roomCode: string, userId: string) {
-    const {role, isCreator} = await this.permission(roomCode, userId);
-    return {role, isCreator};
+    const {access} = await this.permission(roomCode, userId);
+    return {role: access.role, isCreator: access.isOwner, access};
+  }
+
+  /** Every moderation operation goes through here: the caller's ownership is resolved from the DB, never from the client. */
+  private async requireOwner(roomCode: string, userId: string) {
+    const ctx = await this.permission(roomCode, userId);
+    if (!ctx.access.isOwner)
+      throw new ForbiddenError('Only the room owner can do that');
+    return ctx.session;
+  }
+
+  /** Target must be a current, non-owner participant — the owner can never demote, mute or remove themselves. */
+  private requireTarget(session: SessionDocument, targetId: string) {
+    this.validUser(targetId);
+    if (session.createdBy.toString() === targetId)
+      throw new ForbiddenError('The room owner cannot be changed');
+    const participant = session.participants.find(
+      p => p.userId.toString() === targetId,
+    );
+    if (!participant) throw new NotFoundError('Participant not found');
+    return participant;
   }
 
   async setDefaultRole(
@@ -168,29 +218,121 @@ export class WhiteboardService {
     userId: string,
     defaultRole: WhiteboardRole,
   ) {
-    const {session, isCreator} = await this.permission(roomCode, userId);
-    if (!isCreator)
-      throw new ForbiddenError(
-        'Only the room creator can change default access',
-      );
+    const session = await this.requireOwner(roomCode, userId);
     await this.repository.setDefaultRole(session._id!, defaultRole);
   }
 
   async setRole(
     roomCode: string,
-    creatorId: string,
+    ownerId: string,
     userId: string,
     role: WhiteboardRole,
   ) {
-    const {session, isCreator} = await this.permission(roomCode, creatorId);
-    if (!isCreator)
-      throw new ForbiddenError('Only the room creator can change roles');
+    const session = await this.requireOwner(roomCode, ownerId);
+    this.requireTarget(session, userId);
     await this.repository.setRole(session._id!, userId, role);
   }
 
-  private requireEditor(role: WhiteboardRole) {
-    if (role !== 'editor')
-      throw new ForbiddenError('You have view-only access');
+  async setVoicePermissions(
+    roomCode: string,
+    ownerId: string,
+    userId: string,
+    voice: {canJoin?: boolean | null; canSpeak?: boolean | null},
+  ) {
+    const session = await this.requireOwner(roomCode, ownerId);
+    this.requireTarget(session, userId);
+    const valid = (v: unknown) =>
+      v === undefined || v === null || typeof v === 'boolean';
+    if (!valid(voice?.canJoin) || !valid(voice?.canSpeak))
+      throw new BadRequestError('Invalid voice permissions');
+    await this.repository.setParticipantVoice(session._id!, userId, {
+      canJoin: voice.canJoin,
+      canSpeak: voice.canSpeak,
+    });
+  }
+
+  async setRoomSettings(
+    roomCode: string,
+    ownerId: string,
+    input: {boardLocked?: boolean; voicePolicy?: Partial<VoicePolicy>},
+  ) {
+    const session = await this.requireOwner(roomCode, ownerId);
+    const update: {boardLocked?: boolean; voicePolicy?: VoicePolicy} = {};
+    if (input?.boardLocked !== undefined) {
+      if (typeof input.boardLocked !== 'boolean')
+        throw new BadRequestError('Invalid room setting');
+      update.boardLocked = input.boardLocked;
+    }
+    if (input?.voicePolicy !== undefined) {
+      const next = {...voicePolicyOf(session)};
+      for (const key of ['enabled', 'joinMuted', 'speakByDefault'] as const) {
+        const value = input.voicePolicy?.[key];
+        if (value === undefined) continue;
+        if (typeof value !== 'boolean')
+          throw new BadRequestError('Invalid voice policy');
+        next[key] = value;
+      }
+      update.voicePolicy = next;
+    }
+    await this.repository.setRoomSettings(session._id!, update);
+  }
+
+  /**
+   * "Mute everyone now": revokes speaking for the given participants (those
+   * currently in the room). It is a one-off action, distinct from the
+   * speakByDefault policy that governs people who arrive later.
+   */
+  async muteAll(roomCode: string, ownerId: string, userIds: string[]) {
+    const session = await this.requireOwner(roomCode, ownerId);
+    const targets = [...new Set(userIds)].filter(
+      id =>
+        id !== session.createdBy.toString() &&
+        session.participants.some(p => p.userId.toString() === id),
+    );
+    if (targets.length)
+      await this.repository.blockSpeakingMany(session._id!, targets);
+  }
+
+  /**
+   * Undo for "mute everyone" (and any individual owner mutes): removes every
+   * owner-imposed mute so participants can unmute themselves again. Mutes are
+   * stored per participant, so changing the room policy alone never lifts
+   * them — this is the explicit way to. People the owner explicitly allowed
+   * to speak keep that permission.
+   */
+  async unmuteAll(roomCode: string, ownerId: string) {
+    const session = await this.requireOwner(roomCode, ownerId);
+    await this.repository.clearSpeakBlocks(session._id!);
+  }
+
+  async removeParticipant(
+    roomCode: string,
+    ownerId: string,
+    userId: string,
+    name?: string,
+  ) {
+    const session = await this.requireOwner(roomCode, ownerId);
+    this.requireTarget(session, userId);
+    await this.repository.removeParticipant(
+      session._id!,
+      userId,
+      name?.slice(0, 120),
+    );
+  }
+
+  async readmitParticipant(roomCode: string, ownerId: string, userId: string) {
+    const session = await this.requireOwner(roomCode, ownerId);
+    this.validUser(userId);
+    await this.repository.readmitParticipant(session._id!, userId);
+  }
+
+  private requireEditor(access: RoomAccess) {
+    if (!access.canEdit)
+      throw new ForbiddenError(
+        access.role === 'viewer'
+          ? 'You have view-only access'
+          : 'The whiteboard is locked by the room owner',
+      );
   }
 
   private validateObject(input: WhiteboardObjectInput) {
@@ -262,16 +404,26 @@ export class WhiteboardService {
     objectId: string,
     snapshot?: ObjectDocument,
   ) {
-    const seq = await this.repository.nextSeq(sessionId);
-    await this.repository.appendActivity({
-      sessionId,
-      seq,
-      userId: new ObjectId(userId),
-      op,
-      objectId,
-      snapshot,
-      createdAt: new Date(),
-    });
+    // nextSeq is read-then-insert, so two people drawing at the same moment
+    // can race for the same seq; the unique index rejects the loser, which
+    // simply takes the next one. (The object itself is already saved.)
+    for (let attempt = 0; ; attempt++) {
+      const seq = await this.repository.nextSeq(sessionId);
+      try {
+        await this.repository.appendActivity({
+          sessionId,
+          seq,
+          userId: new ObjectId(userId),
+          op,
+          objectId,
+          snapshot,
+          createdAt: new Date(),
+        });
+        return;
+      } catch (error: any) {
+        if (error?.code !== 11000 || attempt >= 9) throw error;
+      }
+    }
   }
 
   async createObject(
@@ -279,8 +431,8 @@ export class WhiteboardService {
     userId: string,
     input: WhiteboardObjectInput,
   ) {
-    const {session, role} = await this.permission(roomCode, userId);
-    this.requireEditor(role);
+    const {session, access} = await this.permission(roomCode, userId);
+    this.requireEditor(access);
     this.validateObject(input);
     const now = new Date();
     const doc: ObjectDocument = {
@@ -305,8 +457,8 @@ export class WhiteboardService {
     objectId: string,
     patch: Partial<WhiteboardObjectInput>,
   ) {
-    const {session, role} = await this.permission(roomCode, userId);
-    this.requireEditor(role);
+    const {session, access} = await this.permission(roomCode, userId);
+    this.requireEditor(access);
     const existing = await this.repository.getObject(session._id!, objectId);
     if (!existing) throw new NotFoundError('Object not found');
     const merged: any = {...existing, ...patch};
@@ -329,8 +481,8 @@ export class WhiteboardService {
   }
 
   async deleteObject(roomCode: string, userId: string, objectId: string) {
-    const {session, role} = await this.permission(roomCode, userId);
-    this.requireEditor(role);
+    const {session, access} = await this.permission(roomCode, userId);
+    this.requireEditor(access);
     const deleted = await this.repository.deleteObject(session._id!, objectId);
     if (!deleted) return null;
     await this.log(session._id!, userId, 'delete', objectId);

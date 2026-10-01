@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { toast } from 'sonner';
 import { whiteboardApi } from './api';
 import { MAX_ZOOM, MIN_ZOOM, boundsOf, decimate, unionBBox } from './geometry';
-import type { BoardSession, Camera, Point, Presence, RemoteCursor, Style, Tool, WhiteboardObject, WhiteboardRole } from './types';
+import type { BoardSession, Camera, Point, Presence, RemoteCursor, RoomAccess, Style, Tool, VoicePolicy, WhiteboardObject, WhiteboardRole } from './types';
 import { useUndoRedo } from './useUndoRedo';
 import { useWhiteboardSocket } from './useWhiteboardSocket';
 
@@ -29,8 +30,9 @@ export function useWhiteboardBoard(roomCode: string | undefined) {
   const bump = useCallback(() => setRenderVersion(v => v + 1), []);
 
   const [session, setSession] = useState<BoardSession | null>(null);
-  const [role, setRoleState] = useState<WhiteboardRole>('viewer');
-  const [isCreator, setIsCreator] = useState(false);
+  const [access, setAccess] = useState<RoomAccess | null>(null);
+  // userIds with a moderation request in flight — shown as pending, never applied optimistically.
+  const [pending, setPending] = useState<ReadonlySet<string>>(new Set());
   const [participants, setParticipants] = useState<Presence[]>([]);
   const [loadError, setLoadError] = useState<string | undefined>(undefined);
   const [loading, setLoading] = useState(true);
@@ -42,7 +44,24 @@ export function useWhiteboardBoard(roomCode: string | undefined) {
   const [strokeWidth, setStrokeWidth] = useState(4);
 
   const history = useUndoRedo();
-  const isEditor = role === 'editor';
+  const role = access?.role ?? 'viewer';
+  const isEditor = !!access?.canEdit;
+  const isCreator = !!access?.isOwner;
+
+  // Losing edit rights mid-session (demoted or board locked) drops any
+  // drawing tool and selection right away; the server already rejects edits.
+  const canEdit = access?.canEdit;
+  // Read by the mutators below so a just-demoted user can't fire off edits
+  // the server would reject (the server remains the actual enforcement).
+  const canEditRef = useRef(false);
+  canEditRef.current = !!canEdit;
+  useEffect(() => {
+    if (canEdit === false) {
+      setTool(t => (t === 'select' || t === 'hand' ? t : 'hand'));
+      selectionRef.current.clear();
+      setSelectedIds([]);
+    }
+  }, [canEdit]);
 
   const setSelection = useCallback((ids: string[]) => { selectionRef.current = new Set(ids); setSelectedIds(ids); bump(); }, [bump]);
 
@@ -65,8 +84,7 @@ export function useWhiteboardBoard(roomCode: string | undefined) {
     onJoined: payload => {
       objectsRef.current = new Map(payload.objects.map(o => [o.id, o]));
       setSession(payload.session);
-      setRoleState(payload.role);
-      setIsCreator(payload.isCreator);
+      setAccess(payload.access);
       selfIdRef.current = payload.userId;
       setSelfId(payload.userId);
       setLoading(false);
@@ -91,25 +109,13 @@ export function useWhiteboardBoard(roomCode: string | undefined) {
     onCursorMove: ({ userId, x, y }) => { if (userId === selfIdRef.current) return; cursorsRef.current.set(userId, { userId, x, y, color: colorForUser(userId), updatedAt: Date.now(), name: cursorsRef.current.get(userId)?.name }); bump(); },
     onCursorRemove: ({ userId }) => { cursorsRef.current.delete(userId); bump(); },
     onPresence: people => { setParticipants(people); people.forEach(p => { const c = cursorsRef.current.get(p.userId); if (c) c.name = p.name; }); },
-    onPermissionsChanged: ({ userId, role: nextRole }) => {
-      if (userId === selfIdRef.current) setRoleState(nextRole);
-      setSession(prev => {
-        if (!prev) return prev;
-        const exists = prev.participants.some(p => p.userId === userId);
-        const participants = exists
-          ? prev.participants.map(p => (p.userId === userId ? { ...p, role: nextRole } : p))
-          : [...prev.participants, { userId, role: nextRole, joinedAt: new Date().toISOString() }];
-        return { ...prev, participants };
-      });
+    onRoomState: ({ session: next, access: nextAccess }) => {
+      setSession(next);
+      setAccess(nextAccess);
     },
-    // Keeps every connected client's view of who-has-what-role current even
-    // when someone else joins after they did — otherwise the creator's
-    // role dropdown shows nothing (or a stale default) for later joiners,
-    // since session.participants was only ever sent to the joiner itself.
-    onParticipants: participants => setSession(prev => (prev ? { ...prev, participants } : prev)),
-    onDefaultRoleChanged: ({ role }) => setSession(prev => (prev ? { ...prev, defaultRole: role } : prev)),
     onClear: () => { objectsRef.current.clear(); liveObjectsRef.current.clear(); setSelection([]); bump(); },
-    onError: message => setLoadError(message),
+    // Individual rejected operations are not fatal to the board; only join failures/removal are.
+    onError: message => toast.error(message),
   });
 
   useEffect(() => {
@@ -122,6 +128,7 @@ export function useWhiteboardBoard(roomCode: string | undefined) {
   const style = useCallback((): Style => ({ color, strokeWidth }), [color, strokeWidth]);
 
   const createObject = useCallback(async (object: WhiteboardObject, opts: { recordHistory?: boolean } = { recordHistory: true }) => {
+    if (!canEditRef.current) return;
     objectsRef.current.set(object.id, object);
     bump();
     setSaveState('saving');
@@ -135,6 +142,7 @@ export function useWhiteboardBoard(roomCode: string | undefined) {
   }, [socket]);
 
   const updateObject = useCallback(async (id: string, patch: Partial<WhiteboardObject>, before?: WhiteboardObject, recordHistory = true) => {
+    if (!canEditRef.current) return;
     const existing = objectsRef.current.get(id);
     if (!existing) return;
     const prior = before ?? { ...existing };
@@ -150,6 +158,7 @@ export function useWhiteboardBoard(roomCode: string | undefined) {
   }, [socket]);
 
   const deleteObject = useCallback(async (id: string, recordHistory = true) => {
+    if (!canEditRef.current) return;
     const existing = objectsRef.current.get(id);
     if (!existing) return;
     objectsRef.current.delete(id);
@@ -163,6 +172,7 @@ export function useWhiteboardBoard(roomCode: string | undefined) {
   }, [socket, createObject]);
 
   const previewPatch = useCallback((id: string, patch: Record<string, unknown>) => {
+    if (!canEditRef.current) return;
     const existing = objectsRef.current.get(id);
     if (!existing) return;
     objectsRef.current.set(id, { ...existing, ...patch } as WhiteboardObject);
@@ -177,8 +187,43 @@ export function useWhiteboardBoard(roomCode: string | undefined) {
 
   const deleteSelected = useCallback(() => { [...selectionRef.current].forEach(id => void deleteObject(id)); }, [deleteObject]);
   const clearBoard = useCallback(async () => { await socket.emit('board:clear'); history.reset(); }, [socket, history]);
-  const setParticipantRole = useCallback((userId: string, nextRole: WhiteboardRole) => socket.emit('participant:setRole', { userId, role: nextRole }), [socket]);
-  const setDefaultRole = useCallback((nextRole: WhiteboardRole) => socket.emit('room:setDefaultRole', { role: nextRole }), [socket]);
+  /**
+   * Every moderation action waits for the server: the UI marks the target as
+   * pending, and the new state arrives via room:state only if authorized.
+   * Failures surface as a toast; nothing local needs reverting.
+   */
+  const moderate = useCallback(async (event: string, payload: Record<string, unknown>, success?: string, target?: string) => {
+    if (target) setPending(prev => new Set(prev).add(target));
+    try {
+      await socket.emitAck(event, payload);
+      if (success) toast.success(success);
+      return true;
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'That change could not be made');
+      return false;
+    } finally {
+      if (target) setPending(prev => { const next = new Set(prev); next.delete(target); return next; });
+    }
+  }, [socket]);
+
+  const nameOf = useCallback((userId: string) => participants.find(p => p.userId === userId)?.name ?? session?.removed?.find(r => r.userId === userId)?.name ?? 'Participant', [participants, session?.removed]);
+  const setParticipantRole = useCallback((userId: string, nextRole: WhiteboardRole) =>
+    moderate('participant:setRole', { userId, role: nextRole }, `${nameOf(userId)} is now ${nextRole === 'editor' ? 'an Editor' : 'a Viewer'}`, userId), [moderate, nameOf]);
+  const setDefaultRole = useCallback((nextRole: WhiteboardRole) => moderate('room:setDefaultRole', { role: nextRole }), [moderate]);
+  /** `null` returns the participant to the room's default. */
+  const setParticipantVoice = useCallback((userId: string, voice: { canJoin?: boolean | null; canSpeak?: boolean | null }) => {
+    const name = nameOf(userId);
+    const message = voice.canJoin === false ? `${name} can no longer use voice`
+      : voice.canJoin !== undefined ? `${name} can now use voice`
+        : voice.canSpeak === false ? `${name} has been muted`
+          : `${name} can speak now`;
+    return moderate('participant:setVoice', { userId, ...voice }, message, userId);
+  }, [moderate, nameOf]);
+  const removeParticipant = useCallback((userId: string) => moderate('participant:remove', { userId }, `${nameOf(userId)} was removed from the room`, userId), [moderate, nameOf]);
+  const readmitParticipant = useCallback((userId: string) => moderate('participant:readmit', { userId }, `${nameOf(userId)} can rejoin the room`, userId), [moderate, nameOf]);
+  const setRoomSettings = useCallback((settings: { boardLocked?: boolean; voicePolicy?: Partial<VoicePolicy> }, success?: string) => moderate('room:setSettings', settings, success), [moderate]);
+  const muteEveryone = useCallback(() => moderate('voice:muteAll', {}, 'Everyone has been muted'), [moderate]);
+  const unmuteEveryone = useCallback(() => moderate('voice:unmuteAll', {}, 'Everyone can unmute themselves again'), [moderate]);
   const renameBoard = useCallback(async (name: string) => { if (!roomCode) return; await whiteboardApi.rename(roomCode, name); setSession(prev => prev ? { ...prev, name } : prev); }, [roomCode]);
 
   const allObjects = useCallback(() => {
@@ -220,13 +265,14 @@ export function useWhiteboardBoard(roomCode: string | undefined) {
   return {
     objectsRef, cameraRef, cursorsRef, liveObjectsRef, selectionRef, viewportSizeRef, renderVersion, allObjects, contentBounds,
     zoomTo, resetZoom, fitToContent,
-    session, role, isEditor, isCreator, participants, selfId, loading, loadError: loadError ?? socket.fatalError,
-    connected: socket.connected, joined: socket.joined, reconnecting: socket.reconnecting, saveState,
+    session, access, role, isEditor, isCreator, participants, selfId, loading, loadError: socket.fatalError ?? loadError, removed: socket.removed,
+    realtime: socket.socket, connected: socket.connected, joined: socket.joined, reconnecting: socket.reconnecting, saveState,
     tool, setTool, color, setColor, strokeWidth, setStrokeWidth,
     selectedIds, setSelection,
     createObject, updateObject, deleteObject, deleteSelected, previewPatch,
     sendLiveStroke, endLiveStroke, sendCursor, clearCursor,
     clearBoard, setParticipantRole, setDefaultRole, renameBoard,
+    pending, setParticipantVoice, removeParticipant, readmitParticipant, setRoomSettings, muteEveryone, unmuteEveryone,
     undo: history.undo, redo: history.redo, canUndo: history.canUndo, canRedo: history.canRedo,
     style, uuid,
     decimatePoints: decimate,

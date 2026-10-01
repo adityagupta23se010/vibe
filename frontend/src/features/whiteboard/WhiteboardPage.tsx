@@ -8,13 +8,24 @@ import { CanvasStage } from './CanvasStage';
 import { Minimap, ZoomControls } from './ZoomControls';
 import { ConnectionStatusBadge, ParticipantsPanel, SaveStatus } from './ParticipantsPanel';
 import { Toolbar } from './Toolbar';
-import { useWhiteboardBoard } from './useWhiteboardBoard';
+import { colorForUser, useWhiteboardBoard } from './useWhiteboardBoard';
+import { RemoteAudio } from '@/features/collaboration/components/RemoteAudio';
+import { VoiceControls } from '@/features/collaboration/components/VoiceControls';
+import { useVoiceChat } from '@/features/collaboration/useVoiceChat';
 
 export default function WhiteboardPage() {
   const { roomCode } = useParams({ strict: false }) as { roomCode: string };
   const { pathname } = useLocation();
   const base = pathname.startsWith('/teacher') ? '/teacher/whiteboard' : '/student/whiteboard';
   const board = useWhiteboardBoard(roomCode);
+  // Voice is a sibling capability of the board inside the same room: it shares
+  // the board's authenticated socket and room membership, but the canvas knows
+  // nothing about it and either can fail without taking down the other.
+  const voice = useVoiceChat(board.realtime, board.joined, board.access);
+  const leaveVoice = voice.leave;
+  // Removal ends everything: stop the mic and peer connections (the server
+  // has already dropped this user from the room and from voice).
+  useEffect(() => { if (board.removed) leaveVoice(); }, [board.removed, leaveVoice]);
   const [renaming, setRenaming] = useState(false);
   const [nameDraft, setNameDraft] = useState('');
 
@@ -23,7 +34,7 @@ export default function WhiteboardPage() {
   if (board.loadError) {
     return (
       <main className="flex min-h-[70vh] items-center justify-center p-6">
-        <EmptyState variant="error" title="Unable to load this whiteboard" description={board.loadError} actionText="Back to whiteboards" onAction={() => window.location.assign(base)} />
+        <EmptyState variant="error" title={board.removed || board.loadError.includes("removed") ? "Removed from this room" : "Unable to load this whiteboard"} description={board.loadError} actionText="Back to whiteboards" onAction={() => window.location.assign(base)} />
       </main>
     );
   }
@@ -32,7 +43,9 @@ export default function WhiteboardPage() {
   }
 
   return (
-    <main className="flex h-[calc(100vh-1.5rem)] flex-col gap-2 p-2 sm:p-3">
+    // Fills exactly the viewport left by the layout's own padding (p-4 / md:p-6),
+    // so the docked voice bar is never pushed below the fold.
+    <main className="flex h-[calc(100dvh-2rem)] flex-col gap-2 p-2 sm:p-3 md:h-[calc(100dvh-3rem)]">
       <header className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2">
           <Link to={base}><Button variant="ghost" size="icon" className="size-8"><ArrowLeft size={16} /></Button></Link>
@@ -54,7 +67,7 @@ export default function WhiteboardPage() {
         </div>
         <div className="flex items-center gap-2">
           <SaveStatus board={board} />
-          <ParticipantsPanel board={board} />
+          <ParticipantsPanel board={board} voice={voice} />
           <Button variant="outline" size="sm" className="gap-1.5" onClick={() => navigator.clipboard.writeText(window.location.href)}><Share2 size={14} /> Share</Button>
           <Link to={`${base}/$roomCode/replay`} params={{ roomCode }}>
             <Button variant="outline" size="sm" className="gap-1.5"><History size={14} /> Replay</Button>
@@ -67,9 +80,11 @@ export default function WhiteboardPage() {
         </div>
       </header>
 
-      {!board.isEditor && (
-        <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
-          You have view-only access to this board.
+      {!board.isEditor && board.access && (
+        <div role="status" className="rounded-md border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
+          {board.access.role === 'editor' && board.session?.boardLocked
+            ? 'The room owner has locked the whiteboard. You can still pan, zoom and follow along.'
+            : 'You have view-only access to this board.'}
         </div>
       )}
 
@@ -82,6 +97,9 @@ export default function WhiteboardPage() {
           <div className="pointer-events-auto"><ZoomControls board={board} /></div>
         </div>
       </div>
+
+      <VoiceControls voice={voice} colorFor={colorForUser} />
+      <RemoteAudio streams={voice.remoteStreams} silenced={voice.silenced} />
     </main>
   );
 }

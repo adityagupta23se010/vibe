@@ -6,24 +6,33 @@ await import('./instrument.js');
 import * as Sentry from '@sentry/node';
 import express from 'express';
 import http from 'node:http';
-import { Server as SocketIOServer } from 'socket.io';
+import {Server as SocketIOServer} from 'socket.io';
 // import session from 'express-session'
-import { useExpressServer, RoutingControllersOptions } from 'routing-controllers';
-import { appConfig } from './config/app.js';
-import { loggingHandler } from './shared/middleware/loggingHandler.js';
-import { generateOpenAPISpec } from './shared/functions/generateOpenApiSpec.js';
-import { getContainer, loadAppModules } from './bootstrap/loadModules.js';
-import { createRateLimiter, HttpErrorHandler, MongoDatabase } from './shared/index.js';
-import { apiReference } from '@scalar/express-api-reference';
-import { printStartupSummary } from './utils/logDetails.js';
-import type { CorsOptions } from 'cors';
-import { authorizationChecker } from './shared/functions/authorizationChecker.js';
-import { currentUserChecker } from './shared/functions/currentUserChecker.js';
-import { startCron } from './utils/startCron.js';
-import { GLOBAL_TYPES } from './types.js';
-import { AUTH_TYPES } from './modules/auth/types.js';
-import type { IAuthService } from './modules/auth/interfaces/IAuthService.js';
-import { WHITEBOARD_TYPES, WhiteboardGateway, WhiteboardService } from './modules/whiteboard/index.js';
+import {useExpressServer, RoutingControllersOptions} from 'routing-controllers';
+import {appConfig} from './config/app.js';
+import {loggingHandler} from './shared/middleware/loggingHandler.js';
+import {generateOpenAPISpec} from './shared/functions/generateOpenApiSpec.js';
+import {getContainer, loadAppModules} from './bootstrap/loadModules.js';
+import {
+  createRateLimiter,
+  HttpErrorHandler,
+  MongoDatabase,
+} from './shared/index.js';
+import {apiReference} from '@scalar/express-api-reference';
+import {printStartupSummary} from './utils/logDetails.js';
+import type {CorsOptions} from 'cors';
+import {authorizationChecker} from './shared/functions/authorizationChecker.js';
+import {currentUserChecker} from './shared/functions/currentUserChecker.js';
+import {startCron} from './utils/startCron.js';
+import {GLOBAL_TYPES} from './types.js';
+import {AUTH_TYPES} from './modules/auth/types.js';
+import type {IAuthService} from './modules/auth/interfaces/IAuthService.js';
+import {
+  WHITEBOARD_TYPES,
+  VoiceSignaling,
+  WhiteboardGateway,
+  WhiteboardService,
+} from './modules/whiteboard/index.js';
 
 const app = express();
 const globalRateLimiter = createRateLimiter();
@@ -33,15 +42,19 @@ app.use(loggingHandler);
 
 app.set('trust proxy', 1);
 
-
-const { controllers, validators } = await loadAppModules(
+const {controllers, validators} = await loadAppModules(
   appConfig.module.toLowerCase(),
 );
 
 const corsOptions: CorsOptions = {
   origin: appConfig.origins,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-API-Key'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'X-Requested-With',
+    'X-API-Key',
+  ],
   credentials: true,
   optionsSuccessStatus: 204,
 };
@@ -90,11 +103,15 @@ await database.connect();
 // calls have the same origin and deployment lifecycle.
 useExpressServer(app, moduleOptions);
 const server = http.createServer(app);
-const io = new SocketIOServer(server, { cors: corsOptions });
+const io = new SocketIOServer(server, {cors: corsOptions});
+// Voice is a capability of the collaboration room: the gateway owns room
+// membership and access, and tells voice whenever either changes.
+const voice = new VoiceSignaling(io);
 new WhiteboardGateway(
   io,
   getContainer().get<IAuthService>(AUTH_TYPES.AuthService),
   getContainer().get<WhiteboardService>(WHITEBOARD_TYPES.Service),
+  [voice],
 );
 
 server.listen(appConfig.port, () => {

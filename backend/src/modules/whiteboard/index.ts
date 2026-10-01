@@ -13,3 +13,6 @@ export const whiteboardModuleValidators: Function[] = [];
 export * from './types.js';
 export * from './WhiteboardService.js';
 export * from './WhiteboardGateway.js';
+export * from './VoiceRegistry.js';
+export * from './VoiceSignaling.js';
+export * from './access.js';

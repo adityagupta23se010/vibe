@@ -119,6 +119,83 @@ export class WhiteboardRepository {
       {$set: {'participants.$.role': role}},
     );
   }
+  /** `null` clears an override so the participant follows the room policy again. */
+  async setParticipantVoice(
+    sessionId: ObjectId,
+    userId: string,
+    voice: {canJoin?: boolean | null; canSpeak?: boolean | null},
+  ) {
+    await this.init();
+    const $set: Record<string, boolean> = {};
+    const $unset: Record<string, ''> = {};
+    for (const key of ['canJoin', 'canSpeak'] as const) {
+      const value = voice[key];
+      if (value === undefined) continue;
+      if (value === null) $unset[`participants.$.voice.${key}`] = '';
+      else $set[`participants.$.voice.${key}`] = value;
+    }
+    if (!Object.keys($set).length && !Object.keys($unset).length) return;
+    await this.sessions.updateOne(
+      {_id: sessionId, 'participants.userId': new ObjectId(userId)},
+      {
+        ...(Object.keys($set).length ? {$set} : {}),
+        ...(Object.keys($unset).length ? {$unset} : {}),
+      },
+    );
+  }
+  /** Mute everyone: force a speak override of `false` onto the listed participants. */
+  async blockSpeakingMany(sessionId: ObjectId, userIds: string[]) {
+    await this.init();
+    await this.sessions.updateOne(
+      {_id: sessionId},
+      {$set: {'participants.$[p].voice.canSpeak': false}},
+      {
+        arrayFilters: [
+          {'p.userId': {$in: userIds.map(id => new ObjectId(id))}},
+        ],
+      },
+    );
+  }
+  /** Unmute everyone: drop every owner-imposed mute, leaving explicit "allowed to speak" overrides intact. */
+  async clearSpeakBlocks(sessionId: ObjectId) {
+    await this.init();
+    await this.sessions.updateOne(
+      {_id: sessionId},
+      {$unset: {'participants.$[p].voice.canSpeak': ''}},
+      {arrayFilters: [{'p.voice.canSpeak': false}]},
+    );
+  }
+  async setRoomSettings(
+    sessionId: ObjectId,
+    settings: Partial<Pick<SessionDocument, 'boardLocked' | 'voicePolicy'>>,
+  ) {
+    await this.init();
+    await this.sessions.updateOne(
+      {_id: sessionId},
+      {$set: {...settings, updatedAt: new Date()}},
+    );
+  }
+  async removeParticipant(
+    sessionId: ObjectId,
+    userId: string,
+    name: string | undefined,
+  ) {
+    await this.init();
+    const id = new ObjectId(userId);
+    await this.sessions.updateOne({_id: sessionId}, {
+      $pull: {participants: {userId: id}, removed: {userId: id}},
+    } as any);
+    await this.sessions.updateOne(
+      {_id: sessionId},
+      {$push: {removed: {userId: id, name, removedAt: new Date()}}},
+    );
+  }
+  async readmitParticipant(sessionId: ObjectId, userId: string) {
+    await this.init();
+    await this.sessions.updateOne({_id: sessionId}, {
+      $pull: {removed: {userId: new ObjectId(userId)}},
+    } as any);
+  }
 
   async listObjects(sessionId: ObjectId) {
     await this.init();

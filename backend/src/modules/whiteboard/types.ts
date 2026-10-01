@@ -76,6 +76,45 @@ export type WhiteboardObjectInput = Omit<
   | 'updatedAt'
 >;
 
+/** Room-wide voice rules, set by the owner. Persisted with the session. */
+export interface VoicePolicy {
+  /** Off = only the owner may use voice ("lock voice"). */
+  enabled: boolean;
+  /** Participants join voice with their microphone off (they may unmute if allowed to speak). */
+  joinMuted: boolean;
+  /** Off = participants may only speak once the owner allows them individually. */
+  speakByDefault: boolean;
+}
+
+/** Owner overrides for one participant; undefined means "follow the room policy". */
+export interface ParticipantVoicePermissions {
+  canJoin?: boolean;
+  canSpeak?: boolean;
+}
+
+export interface RemovedParticipant<Id = string> {
+  userId: Id;
+  name?: string;
+  removedAt: Date;
+}
+
+/** What the requesting user may do right now — computed server-side, sent to that user only. */
+export interface RoomAccess {
+  role: 'owner' | WhiteboardRole;
+  isOwner: boolean;
+  canEdit: boolean;
+  canJoinVoice: boolean;
+  canSpeak: boolean;
+  joinMuted: boolean;
+}
+
+export interface WhiteboardParticipant<Id = string> {
+  userId: Id;
+  role: WhiteboardRole;
+  joinedAt: Date;
+  voice?: ParticipantVoicePermissions;
+}
+
 export interface WhiteboardSession {
   _id?: string;
   createdBy: string;
@@ -83,7 +122,12 @@ export interface WhiteboardSession {
   name: string;
   accessMode: 'anyone-with-link';
   defaultRole: WhiteboardRole;
-  participants: Array<{userId: string; role: WhiteboardRole; joinedAt: Date}>;
+  participants: WhiteboardParticipant[];
+  /** "Lock whiteboard": everyone but the owner is read-only; roles are kept for when it is unlocked. */
+  boardLocked?: boolean;
+  voicePolicy?: VoicePolicy;
+  /** Users the owner removed; they cannot re-enter via the link until re-admitted. */
+  removed?: RemovedParticipant[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -102,11 +146,12 @@ export interface WhiteboardActivityEntry {
 
 export type SessionDocument = Omit<
   WhiteboardSession,
-  '_id' | 'createdBy' | 'participants'
+  '_id' | 'createdBy' | 'participants' | 'removed'
 > & {
   _id?: ObjectId;
   createdBy: ObjectId;
-  participants: Array<{userId: ObjectId; role: WhiteboardRole; joinedAt: Date}>;
+  participants: WhiteboardParticipant<ObjectId>[];
+  removed?: RemovedParticipant<ObjectId>[];
 };
 export type ObjectDocument = Omit<
   WhiteboardObject,
