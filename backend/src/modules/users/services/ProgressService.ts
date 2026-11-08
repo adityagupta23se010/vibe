@@ -1,10 +1,11 @@
-import { Item, ItemsGroup } from '#courses/classes/transformers/Item.js';
-import { COURSES_TYPES } from '#courses/types.js';
-import { BaseService } from '#root/shared/classes/BaseService.js';
-import { ICourseRepository } from '#root/shared/database/interfaces/ICourseRepository.js';
-import { IItemRepository } from '#root/shared/database/interfaces/IItemRepository.js';
-import { IUserRepository } from '#root/shared/database/interfaces/IUserRepository.js';
-import { MongoDatabase } from '#root/shared/database/providers/mongo/MongoDatabase.js';
+import {Item, ItemsGroup} from '#courses/classes/transformers/Item.js';
+import {COURSES_TYPES} from '#courses/types.js';
+import {ContentLockService} from '#courses/services/ContentLockService.js';
+import {BaseService} from '#root/shared/classes/BaseService.js';
+import {ICourseRepository} from '#root/shared/database/interfaces/ICourseRepository.js';
+import {IItemRepository} from '#root/shared/database/interfaces/IItemRepository.js';
+import {IUserRepository} from '#root/shared/database/interfaces/IUserRepository.js';
+import {MongoDatabase} from '#root/shared/database/providers/mongo/MongoDatabase.js';
 import {
   ICourseVersion,
   IWatchTime,
@@ -51,7 +52,32 @@ import { getContainer } from '#root/bootstrap/loadModules.js';
 import { NOTIFICATIONS_TYPES } from '#root/modules/notifications/types.js';
 import type { InviteService } from '#root/modules/notifications/services/InviteService.js';
 import type { InviteRepository } from '#shared/database/providers/mongo/repositories/InviteRepository.js';
+import {
+  NoAuthLeaderboard,
+  NoAuthLeaderboardCache,
+  NoAuthLeaderboardRow,
+} from './NoAuthLeaderboardCache.js';
+import { isGuruSetuProgressCourse } from '#root/modules/users/constants.js';
 
+// Public-leaderboard timestamps, e.g. "11/09/2026, 03:35:09 pm". One shared
+// formatter: identical output to Date#toLocaleString with these options, but
+// creating a formatter per call cost about a second per 20,000 dates.
+const IST_DATE_TIME = new Intl.DateTimeFormat('en-IN', {
+  timeZone: 'Asia/Kolkata',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: true,
+});
+
+// Kept distinct from isGuruSetuProgressCourse: this is specifically about the
+// Gurusetu FDP course's own linearProgressionEnabled=false setting (see the
+// startItem usage below), not about which courses use the feedback-only
+// progress formula. Does not need to extend to other Guru-Setu-progress
+// courses that have linear progression enabled.
 const GURU_SETU_COURSE_ID = '6981df886e100cfe04f9c4ad';
 const GURU_SETU_VERSION_ID = '6981df886e100cfe04f9c4ae';
 
@@ -123,15 +149,15 @@ class ProgressService extends BaseService {
 
     @inject(GLOBAL_TYPES.Database)
     private readonly database: MongoDatabase, // inject the database provider
+
+    @inject(COURSES_TYPES.ContentLockService)
+    private readonly contentLockService: ContentLockService,
   ) {
     super(database);
   }
 
   private isGuruSetu(courseId: string, versionId: string): boolean {
-    return (
-      courseId?.toString() === GURU_SETU_COURSE_ID &&
-      versionId?.toString() === GURU_SETU_VERSION_ID
-    );
+    return isGuruSetuProgressCourse(courseId, versionId);
   }
 
   /**
@@ -143,11 +169,11 @@ class ProgressService extends BaseService {
   private guruSetuProgressFrom(
     feedbackFormIds: string[],
     submittedFormIds: Set<string>,
-  ): { percentCompleted: number; completedItemsCount: number } {
+  ): { percentCompleted: number; completedItemsCount: number; totalFeedbackItems: number } {
     const totalFeedbackItems = feedbackFormIds.length;
 
     if (totalFeedbackItems === 0) {
-      return { percentCompleted: 0, completedItemsCount: 0 };
+      return { percentCompleted: 0, completedItemsCount: 0, totalFeedbackItems: 0 };
     }
 
     const completedCount = feedbackFormIds.filter(id =>
@@ -161,17 +187,18 @@ class ProgressService extends BaseService {
     return {
       percentCompleted,
       completedItemsCount: completedCount,
+      totalFeedbackItems,
     };
   }
 
   public async calculateGuruSetuProgress(
     userId: string,
     courseVersionId: string,
-  ): Promise<{ percentCompleted: number; completedItemsCount: number }> {
+  ): Promise<{ percentCompleted: number; completedItemsCount: number; totalFeedbackItems: number }> {
     const feedbackItems = await this.itemRepo.getFeedbackItems(courseVersionId);
 
     if (feedbackItems.length === 0) {
-      return { percentCompleted: 0, completedItemsCount: 0 };
+      return { percentCompleted: 0, completedItemsCount: 0, totalFeedbackItems: 0 };
     }
 
     const feedbackSubmissions = await this.feedbackRepository.getAllByUserAndVersionId(
@@ -524,7 +551,7 @@ class ProgressService extends BaseService {
     let totalCompletedItemsCount = 0;
 
     // Guru Setu Progress Override
-    if (courseId?.toString() === GURU_SETU_COURSE_ID && courseVersionId?.toString() === GURU_SETU_VERSION_ID) {
+    if (isGuruSetuProgressCourse(courseId, courseVersionId)) {
       const guruProgress = await this.calculateGuruSetuProgress(userId, courseVersionId);
       percentCompleted = guruProgress.percentCompleted;
       totalCompletedItemsCount = guruProgress.completedItemsCount;
@@ -569,16 +596,17 @@ class ProgressService extends BaseService {
         ),
       ]);
 
+      totalCompletedItemsCount = completedItemCount || completedItems;
       percentCompleted = this._calculateProgress(
         totalItems,
-        completedItemCount || completedItems,
+        totalCompletedItemsCount,
       );
     }
 
     await this.enrollmentRepo.updateProgressPercentById(
       enrollment._id.toString(),
       percentCompleted,
-      completedItemCount,
+      isReset ? completedItemCount : totalCompletedItemsCount,
       cohort,
       session,
     );
@@ -1837,8 +1865,10 @@ class ProgressService extends BaseService {
     itemId: string,
     cohortId?: string,
   ): Promise<string> {
+    await this.contentLockService.assertOpenForUser(userId, itemId);
+
     // Guru Setu Progress Override
-    if (courseId?.toString() === GURU_SETU_COURSE_ID && courseVersionId?.toString() === GURU_SETU_VERSION_ID) {
+    if (isGuruSetuProgressCourse(courseId, courseVersionId)) {
       await this.updateEnrollmentProgressPercent(userId, courseId, courseVersionId, undefined, false, undefined, undefined, cohortId);
     }
 
@@ -2442,6 +2472,17 @@ class ProgressService extends BaseService {
       );
     }
 
+    // A video locked mid-watch doesn't complete. Finishing a quiz that was
+    // already submitted is the exception: an attempt started before the lock
+    // may finish, and the production app stops the lesson after submitting.
+    const finishingSubmittedQuiz =
+      item.type === 'QUIZ' &&
+      !!attemptId &&
+      !!(await this.submissionRepository.get(itemId, userId, attemptId));
+    if (!finishingSubmittedQuiz) {
+      await this.contentLockService.assertOpenForUser(userId, itemId);
+    }
+
     /**
      * Sequence validation:
      * Allow stopping if:
@@ -2488,20 +2529,37 @@ class ProgressService extends BaseService {
       // ----------------------------------------------------
       if (item.type !== 'QUIZ') {
         if (!isSkipped) {
-          /**
-           * IMPORTANT:
-           * stopItemTracking should ideally be idempotent.
-           * If already stopped, do not hard-fail unless your business logic requires it.
-           */
-          stoppedWatchTime = await this.progressRepository.stopItemTracking(
-            watchItemId,
-            session,
-          );
+          // Closes this student's open session for this item, falling back
+          // from a stale client watchItemId to the latest open one.
+          stoppedWatchTime =
+            await this.progressRepository.stopItemTrackingForItem(
+              watchItemId,
+              userId,
+              courseId,
+              courseVersionId,
+              itemId,
+              cohortId,
+              session,
+            );
 
           if (!stoppedWatchTime) {
-            // Record was already closed by a concurrent request (endTime already
-            // set). Treat as idempotent success — progress has already advanced.
-            return;
+            // A concurrent stop may have completed the item already, which is
+            // a genuine success. Otherwise nothing was completed, and saying
+            // so lets the client keep the student on this item instead of
+            // moving them on to a lesson the server will refuse to open.
+            const completedMeanwhile =
+              await this.progressRepository.isItemCompleted(
+                userId,
+                courseId,
+                courseVersionId,
+                itemId,
+                cohortId,
+                session,
+              );
+            if (completedMeanwhile) return;
+            throw new BadRequestError(
+              'Your progress on this lesson was not saved. Please reload the page and play it again.',
+            );
           }
 
           await this.validateItemStopEligibility(
@@ -2685,10 +2743,7 @@ class ProgressService extends BaseService {
       // ----------------------------------------------------
       // 9. GURU SETU OVERRIDE
       // ----------------------------------------------------
-      if (
-        courseId?.toString() === GURU_SETU_COURSE_ID &&
-        courseVersionId?.toString() === GURU_SETU_VERSION_ID
-      ) {
+      if (isGuruSetuProgressCourse(courseId, courseVersionId)) {
         const guruProgress = await this.calculateGuruSetuProgress(
           userId,
           courseVersionId,
@@ -4463,6 +4518,8 @@ class ProgressService extends BaseService {
     cohortId?: string,
     session?: ClientSession,
   ): Promise<{ message: String; alreadyCompleted: Boolean }> {
+    await this.contentLockService.assertOpenForUser(userId, itemId);
+
     const item = await this.itemRepo.readItem(courseVersionId, itemId);
     if (!item) {
       throw new NotFoundError(`Item ${itemId} not found`);
@@ -5128,7 +5185,7 @@ class ProgressService extends BaseService {
     }
 
     // Guru Setu Progress Override
-    if (courseId?.toString() === GURU_SETU_COURSE_ID && versionId?.toString() === GURU_SETU_VERSION_ID) {
+    if (isGuruSetuProgressCourse(courseId, versionId)) {
       const guruProgress = await this.calculateGuruSetuProgress(userId, versionId);
       await this.enrollmentRepo.updateProgressPercentById(
         enrollment._id!.toString(),
@@ -5379,7 +5436,33 @@ class ProgressService extends BaseService {
   async getLeaderboardNoAuth(
     courseId: string,
     courseVersionId: string,
+    page?: number,
+    limit?: number,
   ): Promise<GetLeaderboardResponse> {
+    const key = `${courseId}:${courseVersionId}`;
+    const board = await this.noAuthLeaderboardCache.getOrCompute(key, () =>
+      this.buildLeaderboardNoAuth(courseId, courseVersionId, key),
+    );
+
+    const total = board.data.length;
+    if (!limit) {
+      return { ...board, total };
+    }
+    const start = ((page ?? 1) - 1) * limit;
+    return { ...board, data: board.data.slice(start, start + limit), total };
+  }
+
+  private _noAuthLeaderboardCache?: NoAuthLeaderboardCache;
+
+  private get noAuthLeaderboardCache(): NoAuthLeaderboardCache {
+    return (this._noAuthLeaderboardCache ??= new NoAuthLeaderboardCache());
+  }
+
+  private async buildLeaderboardNoAuth(
+    courseId: string,
+    courseVersionId: string,
+    key: string,
+  ): Promise<NoAuthLeaderboard> {
     const course = await this.courseRepo.read(courseId);
     if (!course) {
       throw new BadRequestError(`Invalid courseId: ${courseId}`);
@@ -5390,137 +5473,145 @@ class ProgressService extends BaseService {
       throw new BadRequestError(`Invalid courseVersionId: ${courseVersionId}`);
     }
 
-    // Get all progress records for this course version. This is the public,
-    // cohort-agnostic leaderboard, so it must include cohort-scoped progress
-    // too — not just the cohort-less legacy case.
-    const progressRecords =
-      await this.progressRepository.getAllProgressForCourseVersion(
-        courseId,
-        courseVersionId,
-        undefined,
-        undefined,
-        true,
-      );
-
-    if (!progressRecords) {
-      throw new BadRequestError(
-        `No progress records found for course ${courseId} and version ${courseVersionId}`,
-      );
-    }
-
-    // Get all enrollments to fetch completion percentages. This is the
-    // public, cohort-agnostic leaderboard, so it must include cohort-scoped
-    // enrollments too — not just the cohort-less legacy case.
-    const enrollments = await this.enrollmentRepo.getEnrollmentsByCourseVersion(
+    // Every active student in the version, across all cohorts — this is the
+    // public, cohort-agnostic leaderboard. Only the fields used below are
+    // loaded: whole documents for a large course exhausted the instance's
+    // memory.
+    const enrollments = await this.enrollmentRepo.getLeaderboardEnrollments(
       courseId,
       courseVersionId,
-      undefined,
-      undefined,
-      true,
     );
 
-    if (!enrollments || enrollments.length === 0) {
+    if (enrollments.length === 0) {
       throw new BadRequestError(
         `No enrollments found for course ${courseId} and version ${courseVersionId}`,
       );
     }
 
-    const enrollmentMap = new Map();
+    // One row per student. A student enrolled in more than one cohort of the
+    // version keeps their furthest enrollment.
+    const enrollmentByUser = new Map<
+      string,
+      { completionPercentage: number; enrolledAt: Date | null }
+    >();
     for (const enrollment of enrollments) {
-      enrollmentMap.set(enrollment.userId.toString(), {
-        completionPercentage: enrollment.percentCompleted ?? 0,
-        enrolledAt: enrollment.enrollmentDate,
-      });
+      const userId = enrollment.userId?.toString();
+      if (!userId) continue;
+      const completionPercentage = Math.min(
+        100,
+        enrollment.percentCompleted ?? 0,
+      );
+      const existing = enrollmentByUser.get(userId);
+      if (!existing || completionPercentage > existing.completionPercentage) {
+        enrollmentByUser.set(userId, {
+          completionPercentage,
+          enrolledAt: enrollment.enrollmentDate ?? null,
+        });
+      }
     }
 
-    // Get user names for all enrolled students
-    const userIds = enrollments.map(e => e.userId.toString());
-    const users = await this.userRepo.getUsersByIds(userIds);
-    if (!users || users.length === 0) {
+    // Finishers are not recalculated: a student at 100% with a completion
+    // date keeps the row built when they first appeared as finished. Drop
+    // any who are no longer enrolled at 100% so they are rebuilt below.
+    const settledFinishers = this.noAuthLeaderboardCache.finishersFor(key);
+    for (const userId of settledFinishers.keys()) {
+      if (enrollmentByUser.get(userId)?.completionPercentage !== 100) {
+        settledFinishers.delete(userId);
+      }
+    }
+
+    const toLookUp = [...enrollmentByUser.keys()].filter(
+      userId => !settledFinishers.has(userId),
+    );
+    const [completionRows, users] = await Promise.all([
+      this.progressRepository.getCompletionForUsers(
+        courseId,
+        courseVersionId,
+        toLookUp,
+      ),
+      this.userRepo.getNamesAndEmailsByIds(toLookUp),
+    ]);
+
+    if (toLookUp.length > 0 && users.length === 0 && settledFinishers.size === 0) {
       throw new BadRequestError(
         'No users found for the given course and version',
       );
     }
-    const userMap = new Map();
-    for (const user of users) {
-      if (user) {
-        const fullName =
-          `${user.firstName || ''} ${user.lastName || ''}`.trim() ||
-          'Unknown User';
-        userMap.set(user._id?.toString(), { name: fullName, email: user.email });
+
+    // A student can have more than one progress row in a version; take the
+    // earliest completion among them.
+    const completedAtByUser = new Map<string, Date>();
+    for (const row of completionRows) {
+      if (!row.completed || !row.completedAt) continue;
+      const previous = completedAtByUser.get(row.userId);
+      if (!previous || new Date(row.completedAt) < new Date(previous)) {
+        completedAtByUser.set(row.userId, row.completedAt);
       }
     }
 
-    const formatToIST = (date?: Date | string | null): string => {
-      if (!date) return '—';
+    const userById = new Map<string, { name: string; email?: string }>();
+    for (const user of users) {
+      const fullName =
+        `${user.firstName || ''} ${user.lastName || ''}`.trim() ||
+        'Unknown User';
+      userById.set(user._id, { name: fullName, email: user.email });
+    }
 
-      return new Date(date).toLocaleString('en-IN', {
-        timeZone: 'Asia/Kolkata',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: true,
-      });
-    };
+    const rows: NoAuthLeaderboardRow[] = [];
+    for (const [userId, enrollment] of enrollmentByUser) {
+      const settled = settledFinishers.get(userId);
+      if (settled) {
+        rows.push(settled);
+        continue;
+      }
 
-    // Combine progress and enrollment data
-    const leaderboardData = progressRecords.map(progress => {
-      const userId = progress.userId.toString();
-      const enrollment = enrollmentMap.get(userId);
-      const user = userMap.get(userId);
-
-      return {
+      const user = userById.get(userId);
+      const completedAt = completedAtByUser.get(userId) ?? null;
+      const row: NoAuthLeaderboardRow = {
         userId,
         userName: user?.name || 'Unknown User',
         email: user?.email || 'No email',
-
-        completionPercentage: Math.min(100, enrollment?.completionPercentage ?? 0),
-
-        completedAt:
-          progress.completed && progress.completedAt
-            ? formatToIST(progress.completedAt)
-            : 'Not completed yet',
-
-        enrolledAt: enrollment?.enrolledAt
-          ? formatToIST(enrollment.enrolledAt)
+        completionPercentage: enrollment.completionPercentage,
+        completedAtMs: completedAt ? new Date(completedAt).getTime() : null,
+        completedAt: completedAt
+          ? IST_DATE_TIME.format(new Date(completedAt))
+          : 'Not completed yet',
+        enrolledAt: enrollment.enrolledAt
+          ? IST_DATE_TIME.format(new Date(enrollment.enrolledAt))
           : 'No enrollment date',
       };
-    });
+      if (row.completionPercentage === 100 && row.completedAtMs !== null) {
+        settledFinishers.set(userId, row);
+      }
+      rows.push(row);
+    }
 
-    // Sort by Progress % (highest first), then by Completion Date (earliest first) for ties
-    const sortedLeaderboard = leaderboardData.sort((a, b) => {
-      // Primary sort: by completion percentage (descending - highest first)
+    // Progress % (highest first), then completion time (earliest first).
+    // Sorts on the raw time: the display strings do not parse back to dates.
+    rows.sort((a, b) => {
       if (a.completionPercentage !== b.completionPercentage) {
         return b.completionPercentage - a.completionPercentage;
       }
-
-      // Secondary sort: by completedAt (ascending - earliest first) for same percentage
-      if (a.completedAt && b.completedAt) {
-        return (
-          new Date(a.completedAt).getTime() - new Date(b.completedAt).getTime()
-        );
+      if (a.completedAtMs !== null && b.completedAtMs !== null) {
+        return a.completedAtMs - b.completedAtMs;
       }
-
-      // If one has completedAt and other doesn't, prioritize the one with completedAt
-      if (a.completedAt) return -1;
-      if (b.completedAt) return 1;
-
-      // Both don't have completedAt, maintain current order
+      if (a.completedAtMs !== null) return -1;
+      if (b.completedAtMs !== null) return 1;
       return 0;
     });
-
-    const rankedLeaderboard = sortedLeaderboard.map((student, index) => ({
-      rank: index + 1,
-      ...student,
-    }));
 
     return {
       course: course.name,
       version: courseVersion.version,
-      data: rankedLeaderboard,
+      data: rows.map((row, index) => ({
+        rank: index + 1,
+        userId: row.userId,
+        userName: row.userName,
+        email: row.email,
+        completionPercentage: row.completionPercentage,
+        completedAt: row.completedAt,
+        enrolledAt: row.enrolledAt,
+      })),
     };
   }
 

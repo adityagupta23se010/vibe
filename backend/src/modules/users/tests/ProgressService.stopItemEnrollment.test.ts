@@ -29,6 +29,7 @@ const WATCH_ITEM_ID = 'watchtime-1';
 
 function makeService() {
   const service: any = Object.create(ProgressService.prototype);
+  service.contentLockService = {assertOpenForUser: async () => {}};
 
   service._withTransaction = async (fn: any) => fn({} as any);
 
@@ -64,7 +65,8 @@ function makeService() {
       currentSection: SECTION_ID,
       currentItem: ITEM_ID,
     }),
-    stopItemTracking: async () => ({
+    isItemCompleted: async () => false,
+    stopItemTrackingForItem: async () => ({
       _id: WATCH_ITEM_ID,
       startTime: new Date('2026-08-19T10:00:00Z'),
       endTime: new Date('2026-08-19T10:11:00Z'),

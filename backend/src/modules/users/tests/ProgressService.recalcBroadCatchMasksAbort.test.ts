@@ -48,6 +48,7 @@ describe('stopItem non-fatal recalculation vs. a genuine MongoDB-level error', (
 
   function makeService() {
     const service: any = Object.create(ProgressService.prototype);
+    service.contentLockService = {assertOpenForUser: async () => {}};
     // Real BaseService.db, so the REAL (unstubbed) _withTransaction opens a
     // genuine MongoDB session/transaction, exactly like production.
     service.db = db;
@@ -74,7 +75,7 @@ describe('stopItem non-fatal recalculation vs. a genuine MongoDB-level error', (
         currentSection: SECTION_ID,
         currentItem: ITEM_ID,
       }),
-      stopItemTracking: async () => ({
+      stopItemTrackingForItem: async () => ({
         _id: WATCH_ITEM_ID,
         startTime: new Date('2026-08-19T10:00:00Z'),
         endTime: new Date('2026-08-19T10:11:00Z'),

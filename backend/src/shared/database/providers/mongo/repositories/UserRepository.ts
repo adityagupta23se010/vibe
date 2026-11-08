@@ -1,4 +1,7 @@
-import {IUserRepository} from '#shared/database/interfaces/IUserRepository.js';
+import {
+  IUserRepository,
+  UserNameAndEmail,
+} from '#shared/database/interfaces/IUserRepository.js';
 import {IUser} from '#shared/interfaces/models.js';
 import {instanceToPlain, plainToInstance} from 'class-transformer';
 import {injectable, inject} from 'inversify';
@@ -257,11 +260,56 @@ export class UserRepository implements IUserRepository {
   }
 
   /**
+   * Name and email only, for lists that cover a whole course (the public
+   * leaderboard), where loading full user documents is too heavy.
+   */
+  async getNamesAndEmailsByIds(ids: string[]): Promise<UserNameAndEmail[]> {
+    await this.init();
+    if (!ids.length) return [];
+    const users = await this.usersCollection
+      .find(
+        {_id: {$in: ids.map(id => new ObjectId(id))}},
+        {projection: {firstName: 1, lastName: 1, email: 1}},
+      )
+      .toArray();
+    return users.map(user => ({
+      _id: user._id?.toString(),
+      firstName: user.firstName,
+      lastName: user.lastName,
+      email: user.email,
+    }));
+  }
+
+  /**
    * Searches for users by name or email
    * @param searchTerm The search term to match against user names or emails
    * @param session Optional MongoDB session
    * @returns Promise with array of user search results
    */
+  async getAllUsers(session?: ClientSession) {
+    await this.init();
+
+    const projection = {
+      _id: 1,
+      firstName: 1,
+      lastName: 1,
+      email: 1,
+      roles: 1,
+    };
+
+    const users = await this.usersCollection
+      .find({}, {session, projection})
+      .toArray();
+
+    return users.map(user => ({
+      _id: user._id as ObjectId,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      email: user.email,
+      roles: (user.roles ?? 'user') as 'admin' | 'user',
+    }));
+  }
+
   async searchUsers(searchTerm: string, session?: ClientSession) {
     await this.init();
 

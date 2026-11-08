@@ -62,6 +62,18 @@ class ProgressRepository {
       // Index already exists
     }
 
+    // Course-wide reads (leaderboards, getAllProgressForCourseVersion) filter
+    // on courseId + courseVersionId without a userId, so the index above, which
+    // leads with userId, cannot serve them. Not awaited: the first build on a
+    // large collection must not hold up every progress request on a fresh
+    // instance while it runs.
+    this.progressCollection
+      .createIndex({ courseId: 1, courseVersionId: 1 }, { background: true })
+      .catch(() => {
+        // Index already exists, or the build failed — reads still work
+        // without it, only slower.
+      });
+
     try {
       await this.watchTimeCollection.createIndex(
         {
@@ -728,6 +740,59 @@ class ProgressRepository {
   }
 
   /**
+   * Close the student's open watch session for one item, for the live stop
+   * path.
+   *
+   * stopItemTracking trusts the client's watchTimeId outright. After a refresh
+   * the client can send a stale id (the course store keeps it in
+   * localStorage): a session from before the refresh, or another item's
+   * session that is already closed. That used to match nothing, stopItem took
+   * it for a concurrent duplicate and returned success, and the item never
+   * completed — the next lesson then refused to open until progress was reset.
+   *
+   * The given id is used only if it is this student's open session for this
+   * item. Otherwise the most recent open session for the item is closed, which
+   * is the one the student just watched. Returns null when the student has no
+   * open session for the item at all.
+   */
+  async stopItemTrackingForItem(
+    watchTimeId: string,
+    userId: string,
+    courseId: string,
+    courseVersionId: string,
+    itemId: string,
+    cohortId?: string,
+    session?: ClientSession,
+  ): Promise<IWatchTime | null> {
+    await this.init();
+    const openSession = {
+      userId: new ObjectId(userId),
+      courseId: new ObjectId(courseId),
+      courseVersionId: new ObjectId(courseVersionId),
+      itemId: new ObjectId(itemId),
+      ...(cohortId ? this.cohortIdMatch(cohortId) : {}),
+      isDeleted: {$ne: true},
+      endTime: {$exists: false},
+    };
+    const close = {$set: {endTime: new Date()}};
+
+    if (ObjectId.isValid(watchTimeId)) {
+      const exact = await this.watchTimeCollection.findOneAndUpdate(
+        {...openSession, _id: new ObjectId(watchTimeId)},
+        close,
+        {returnDocument: 'after', session},
+      );
+      if (exact) return exact;
+    }
+
+    return this.watchTimeCollection.findOneAndUpdate(openSession, close, {
+      sort: {startTime: -1},
+      returnDocument: 'after',
+      session,
+    });
+  }
+
+  /**
    * Watch sessions that were started but never stopped.
    *
    * Completion is modelled as "a watchTime row with a non-null endTime", so a
@@ -1082,6 +1147,39 @@ class ProgressRepository {
       currentModule: progress.currentModule?.toString(),
       currentSection: progress.currentSection?.toString(),
       currentItem: progress.currentItem?.toString(),
+    }));
+  }
+
+  /**
+   * Completion state only, for the given students in one course version,
+   * across all cohorts and skipping soft-deleted rows. Used by the public
+   * leaderboard, which needs neither the current-position fields nor
+   * adminSkips, and only asks about students it has not already settled.
+   * A student can have more than one row; callers dedupe.
+   */
+  async getCompletionForUsers(
+    courseId: string,
+    courseVersionId: string,
+    userIds: string[],
+  ): Promise<{ userId: string; completed: boolean; completedAt: Date | null }[]> {
+    await this.init();
+    if (!userIds.length) return [];
+    const rows = await this.progressCollection
+      .find(
+        {
+          userId: { $in: userIds.flatMap(id => [new ObjectId(id), id]) },
+          courseId: { $in: [new ObjectId(courseId), courseId] },
+          courseVersionId: { $in: [new ObjectId(courseVersionId), courseVersionId] },
+          isDeleted: { $ne: true },
+        },
+        { projection: { _id: 0, userId: 1, completed: 1, completedAt: 1 } },
+      )
+      .toArray();
+
+    return rows.map(row => ({
+      userId: row.userId?.toString(),
+      completed: !!row.completed,
+      completedAt: row.completedAt ?? null,
     }));
   }
   /**
